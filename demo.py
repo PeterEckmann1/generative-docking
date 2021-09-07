@@ -7,6 +7,7 @@ from torch.utils.data.dataset import random_split
 from torch import nn
 from torch import optim
 import matplotlib.pyplot as plt
+import torch.nn.functional as F
 import os
 import json
 from rdkit.Chem.Crippen import MolLogP
@@ -20,13 +21,13 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 class Net(nn.Module):
     def __init__(self, input_len):
         super(Net, self).__init__()
-        self.fc = nn.Sequential(nn.Linear(input_len, 256),
+        self.fc = nn.Sequential(nn.Linear(input_len, 500),
                                 nn.ReLU(),
-                                nn.Linear(256, 64),
+                                nn.Linear(500, 500),
                                 nn.ReLU(),
-                                nn.Linear(64, 16),
+                                nn.Linear(500, 500),
                                 nn.ReLU(),
-                                nn.Linear(16, 1))
+                                nn.Linear(500, 1))
 
     def forward(self, x):
         return self.fc(x)
@@ -61,11 +62,13 @@ def load_data(data_dir):
     dataset = TensorDataset(x, y)
     train_data, test_data = random_split(dataset, [int(round(len(dataset) * 0.8)), int(round(len(dataset) * 0.2))])
     train_dataloader, test_dataloader = DataLoader(train_data, batch_size=10000, shuffle=True), DataLoader(test_data, batch_size=10000)
-    return train_dataloader, test_dataloader, symbol_to_idx, idx_to_symbol, max_len
+    return train_dataloader, test_dataloader, symbol_to_idx, idx_to_symbol, max_len, x.mean(dim=0)
 
 
 def train(model, train_dataloader, test_dataloader):
-    for epoch in range(5):
+    loss_f = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    for epoch in range(30):
         for x_batch, y_batch in train_dataloader:
             optimizer.zero_grad()
             loss = loss_f(model(x_batch), y_batch)
@@ -76,8 +79,7 @@ def train(model, train_dataloader, test_dataloader):
             total_loss = 0
             for x_batch, y_batch in test_dataloader:
                 total_loss += loss_f(model(x_batch), y_batch).item()
-            print(total_loss)
-    return model
+    torch.save(model.state_dict(), 'model.pt')
 
 
 def indices_to_smiles(indices, idx_to_symbol):
@@ -85,46 +87,54 @@ def indices_to_smiles(indices, idx_to_symbol):
     return sf.decoder(selfies)
 
 
-def dream(model, starting_one_hot):
+def dream(model, starting_one_hot, target, base_props):
+    target_tensor = torch.tensor([[target]], dtype=torch.float).to('cuda')
     old_smiles = ''
     in_selfies = starting_one_hot
-    in_selfies += torch.rand(in_selfies.shape, device='cuda') * 0.5
+    in_selfies += base_props * 2
+    #in_selfies += torch.rand(in_selfies.shape, device='cuda') * 0.95
     in_selfies[in_selfies > 1] = 1
     in_selfies = in_selfies.clone().detach().view((1, -1)).requires_grad_(True)
-    reverse_optimizer = optim.Adam([in_selfies], lr=0.01)
+    reverse_optimizer = optim.Adam([in_selfies], lr=0.1)
+    loss_f = nn.MSELoss()
     vals = []
-    for epoch in range(10000):
-        reverse_optimizer.zero_grad()
+    losses = []
+    for epoch in range(1000):
         out = model(in_selfies)
+        loss = loss_f(out, target_tensor)
         indices = in_selfies.detach().view((max_len, -1)).argmax(dim=1).tolist()
         smiles = indices_to_smiles(indices, idx_to_symbol)
+        losses.append(out.item())
         if smiles != old_smiles:
-            print(f"New molecule: logP: {logp(smiles)}, SMILES: {smiles}")
+            # print(f"New molecule: logP: {logp(smiles)}, SMILES: {smiles}")
             vals.append(logp(smiles))
             old_smiles = smiles
-        out.backward()
+        else:
+            vals.append(vals[-1])
+        reverse_optimizer.zero_grad()
+        loss.backward()
         reverse_optimizer.step()
     return old_smiles, vals
 
 
 if __name__ == '__main__':
     # preprocess_and_save_data('gdb11_size09.smi', 'data')
-    train_dataloader, test_dataloader, symbol_to_idx, idx_to_symbol, max_len = load_data('data')
+    train_dataloader, test_dataloader, symbol_to_idx, idx_to_symbol, max_len, base_probs = load_data('data')
     model = Net(max_len * len(symbol_to_idx)).to('cuda')
-    loss_f = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
 
-    model = train(model, train_dataloader, test_dataloader)
+    # train(model, train_dataloader, test_dataloader)
+    model.load_state_dict(torch.load('model.pt'))
 
     x_batch, y_batch = next(iter(test_dataloader))
-    plt.scatter(model(x_batch).detach().cpu(), y_batch.detach().cpu())
-    plt.xlabel('pred')
-    plt.ylabel('true')
-    plt.show()
+
+    # plt.scatter(model(x_batch).detach().cpu(), y_batch.detach().cpu())
+    # plt.xlabel('pred')
+    # plt.ylabel('true')
+    # plt.show()
 
     improvement_count = 0
     from tqdm import tqdm
     for i in tqdm(range(100)):
-        final_smiles, vals = dream(model, x_batch[2])
+        final_smiles, vals = dream(model, x_batch[i], -10, base_probs)      #0.84 for 10, 0.89 for -10
         improvement_count += int(vals[0] > vals[-1])
     print(improvement_count / 100)
